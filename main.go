@@ -19,14 +19,13 @@ var logger *log.Logger
 func main() {
 	logger = log.New(os.Stdout, "[oomdoom] ", log.LstdFlags)
 
-	oomExe := flag.String("oom-prog", "", "oom prog")
+	hogProg := flag.String("hog-prog", "", "hog prog")
 	memLimB := flag.Uint64("mem-limit-bytes", 0, "cgroup mem and memsw limit in bytes")
-	breathingRoomKB := flag.Uint64("breathing-room-kb", 0, "KB to leave remaining in cgroup")
-	concurrentOoms := flag.Int("n", 0, "concurrent oom processes")
+	concurrentJobs := flag.Int("n", 0, "concurrent processes")
 	flag.Parse()
 
-	for i := 0; i < *concurrentOoms; i++ {
-		go runOomProcesses(*oomExe, *memLimB, *breathingRoomKB, i)
+	for i := 0; i < *concurrentJobs; i++ {
+		go runHogProcesses(*hogProg, *memLimB, i)
 	}
 
 	for {
@@ -34,9 +33,9 @@ func main() {
 	}
 }
 
-func runOomProcesses(oomExe string, memLimB, breathingRoomKB uint64, workerID int) {
+func runHogProcesses(hogProg string, memLimB uint64, workerID int) {
 	for {
-		logger.Printf("worker %d running oom process with memory limit %d", workerID, memLimB)
+		logger.Printf("worker %d running experiment with memory limit %d", workerID, memLimB)
 
 		id := uuid.New()
 		cgroupPath := "/sys/fs/cgroup/memory/" + id
@@ -48,21 +47,23 @@ func runOomProcesses(oomExe string, memLimB, breathingRoomKB uint64, workerID in
 		must("setting swappiness", ioutil.WriteFile(cgroupPath+"/memory.swappiness", []byte("100"), 0))
 
 		memLimKB := memLimB / 1024
-		bulkOfMem := memLimKB * 19 / 20
+		bulkOfMemKB := memLimKB * 19 / 20
 
-		hogMemoryCmd := exec.Command(oomExe, fmt.Sprintf("%d", bulkOfMem))
+		hogMemoryCmd := exec.Command(hogProg, fmt.Sprintf("%d", bulkOfMemKB))
 		hogMemoryCmd.Stdout = os.Stdout
 		hogMemoryCmd.Stderr = os.Stderr
-		must("launching oom process", hogMemoryCmd.Start())
+		must("launching hog process", hogMemoryCmd.Start())
 
 		cgroupProcs := cgroupPath + "/cgroup.procs"
 		must("adding 1st process to cgroup", ioutil.WriteFile(cgroupProcs, []byte(fmt.Sprintf("%d", hogMemoryCmd.Process.Pid)), 0))
-		actualMemUsageB := awaitPaging(cgroupPath)
+		actualMemUsageB, actualMemswUsageB := awaitPaging(cgroupPath)
 
 		logger.Printf("worker %d (uuid %s) paged\n", workerID, id)
-		remainingKB := (memLimB - uint64(actualMemUsageB)) / 1024
-		logger.Printf("worker %d %dKB remaining, will leave %dKB\n", workerID, remainingKB, breathingRoomKB)
-		remainderCmd := exec.Command(oomExe, fmt.Sprintf("%d", remainingKB-breathingRoomKB))
+		logger.Printf("worker %d %dB mem, %dB memsw remaining\n", workerID, memLimB-uint64(actualMemUsageB), memLimB-uint64(actualMemswUsageB))
+
+		remainderMemKB := (memLimB - uint64(actualMemswUsageB) + 4096) / 1024
+		logger.Printf("worker %d starting remainder with %dKB\n", workerID, remainderMemKB)
+		remainderCmd := exec.Command(hogProg, fmt.Sprintf("%d", remainderMemKB))
 		remainderCmd.Stdout = os.Stdout
 		remainderCmd.Stderr = os.Stderr
 		must("launching remainder process", remainderCmd.Start())
@@ -82,29 +83,64 @@ func runOomProcesses(oomExe string, memLimB, breathingRoomKB uint64, workerID in
 			close(remainderDone)
 		}()
 
-		<-hogDone
-		<-remainderDone
+		select {
+		case <-hogDone:
+			logger.Printf("worker %d killing remainder process\n", workerID)
+			must("killing remainder process", killAndWait(remainderCmd))
+		case <-remainderDone:
+			logger.Printf("worker %d killing hog process\n", workerID)
+			must("killing hog process", killAndWait(hogMemoryCmd))
+		case <-time.After(time.Second * 5):
+			logger.Printf("worker %d (uuid %s) has not been OOM killed\n", workerID, id)
+			actualMemB, actualMemswB := readActualMemoryUsage(cgroupPath)
+			logger.Printf("worker %d mem: %dB, memsw: %dB\n", workerID, actualMemB, actualMemswB)
+			if uint64(actualMemswUsageB) > memLimB {
+				logger.Printf("worker %d (uuid %s) yielded a result!\n", workerID, id)
+				for {
+					time.Sleep(time.Hour)
+				}
+			}
+			must("killing hog process", killAndWait(hogMemoryCmd))
+			must("killing remainder process", killAndWait(remainderCmd))
+		}
 
 		must("remove cgroup path", os.Remove(cgroupPath))
 
-		logger.Println("done running oom process")
+		logger.Printf("worker %d done running experiment\n", workerID)
 	}
 }
 
-func awaitPaging(cgroupPath string) int {
-	for {
-		memUsageStr, err := ioutil.ReadFile(cgroupPath + "/memory.usage_in_bytes")
-		must("reading mem usage", err)
-		memUsage, err := strconv.Atoi(strings.TrimSpace(string(memUsageStr)))
-		must("converting mem usage", err)
+func killAndWait(cmd *exec.Cmd) error {
+	if err := cmd.Process.Kill(); err != nil {
+		if err.Error() == "os: process already finished" {
+			return nil
+		}
+		return err
+	}
+	cmd.Process.Wait()
+	return nil
+}
 
-		memswUsageStr, err := ioutil.ReadFile(cgroupPath + "/memory.memsw.usage_in_bytes")
-		must("reading memsw usage", err)
-		memswUsage, err := strconv.Atoi(strings.TrimSpace(string(memswUsageStr)))
-		must("converting memsw usage", err)
+func readActualMemoryUsage(cgroupPath string) (int, int) {
+	memUsageStr, err := ioutil.ReadFile(cgroupPath + "/memory.usage_in_bytes")
+	must("reading mem usage", err)
+	memUsage, err := strconv.Atoi(strings.TrimSpace(string(memUsageStr)))
+	must("converting mem usage", err)
+
+	memswUsageStr, err := ioutil.ReadFile(cgroupPath + "/memory.memsw.usage_in_bytes")
+	must("reading memsw usage", err)
+	memswUsage, err := strconv.Atoi(strings.TrimSpace(string(memswUsageStr)))
+	must("converting memsw usage", err)
+
+	return memUsage, memswUsage
+}
+
+func awaitPaging(cgroupPath string) (int, int) {
+	for {
+		memUsage, memswUsage := readActualMemoryUsage(cgroupPath)
 
 		if memswUsage != memUsage {
-			return memUsage
+			return memUsage, memswUsage
 		}
 
 		time.Sleep(time.Second)
@@ -114,5 +150,6 @@ func awaitPaging(cgroupPath string) int {
 func must(action string, err error) {
 	if err != nil {
 		logger.Printf("error %s: %s\n", action, err)
+		os.Exit(1)
 	}
 }
