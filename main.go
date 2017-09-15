@@ -48,46 +48,37 @@ func runExperiment(hogProg string, memLimB uint64, workerID int) {
 	setupLimits(cgroupPath, memLimB)
 
 	memLimKB := memLimB / 1024
-	bulkOfMemKB := memLimKB * 19 / 20
+	fourtyFivePercentStr := fmt.Sprintf("%d", memLimKB*9/20)
 
-	hogMemoryCmd := runInCgroup(cgroupPath, hogProg, fmt.Sprintf("%d", bulkOfMemKB))
+	hogMemoryCmd := runInCgroup(cgroupPath, hogProg, fourtyFivePercentStr, fourtyFivePercentStr)
 	hogDone, err := launch(hogMemoryCmd, fmt.Sprintf("worker %d hog done", workerID))
 	must("launching hog process", err)
 
-	actualMemUsageB, actualMemswUsageB := awaitPaging(cgroupPath)
+	_, actualMemswUsageB := readActualMemoryUsage(cgroupPath)
 
-	logger.Printf("worker %d (uuid %s) paged\n", workerID, id)
-	logger.Printf("worker %d %dB mem, %dB memsw remaining\n", workerID, memLimB-actualMemUsageB, memLimB-actualMemswUsageB)
+	halfOfRemainingHeadroom := fmt.Sprintf("%d", ((memLimB-actualMemswUsageB)/1024-128)/2)
+	approachEdgeCmd := runInCgroup(cgroupPath, hogProg, halfOfRemainingHeadroom, halfOfRemainingHeadroom)
+	approachingEdgeDone, err := launch(approachEdgeCmd, fmt.Sprintf("worker %d approaching-edge done", workerID))
+	must("launching approaching-edge process", err)
 
-	remainderMemKB := (memLimB - actualMemswUsageB + 4096) / 1024
-	logger.Printf("worker %d starting remainder with %dKB\n", workerID, remainderMemKB)
-	remainderCmd := runInCgroup(cgroupPath, hogProg, fmt.Sprintf("%d", remainderMemKB))
-	remainderDone, err := launch(remainderCmd, fmt.Sprintf("worker %d remainder done", workerID))
-	must("launching remainder process", err)
+	finalRegularPagesKB, finalHugePagesKB := calculcateMemoryForFinalProcess(workerID, cgroupPath, memLimB)
+	finalCmd := runInCgroup(cgroupPath, hogProg, fmt.Sprintf("%d", finalRegularPagesKB), fmt.Sprintf("%d", finalHugePagesKB))
+	finalDone, err := launch(finalCmd, fmt.Sprintf("worker %d final done", workerID))
+	must("launching final process", err)
 
-	select {
-	case <-hogDone:
-		logger.Printf("worker %d killing remainder process\n", workerID)
-		must("killing remainder process", kill(remainderCmd))
-	case <-remainderDone:
-		logger.Printf("worker %d killing hog process\n", workerID)
-		must("killing hog process", kill(hogMemoryCmd))
-	case <-time.After(time.Second * 5):
-		logger.Printf("worker %d (uuid %s) has not been OOM killed\n", workerID, id)
-		actualMemB, actualMemswB := readActualMemoryUsage(cgroupPath)
-		logger.Printf("worker %d mem: %dB, memsw: %dB\n", workerID, actualMemB, actualMemswB)
-		if uint64(actualMemswUsageB) > memLimB {
-			logger.Printf("worker %d (uuid %s) yielded a result!\n", workerID, id)
-			for {
-				time.Sleep(time.Hour)
-			}
-		}
-		must("killing hog process", kill(hogMemoryCmd))
-		must("killing remainder process", kill(remainderCmd))
-	}
+	time.Sleep(time.Millisecond * 500)
+
+	accessProcessMemory(hogMemoryCmd)
+	accessProcessMemory(approachEdgeCmd)
+	accessProcessMemory(finalCmd)
+
+	logger.Printf("worker %d killing processes\n", workerID)
+	must("killing processes", killAll(hogMemoryCmd, approachEdgeCmd, finalCmd))
+	<-hogDone
+	<-approachingEdgeDone
+	<-finalDone
 
 	must("remove cgroup path", os.Remove(cgroupPath))
-
 	logger.Printf("worker %d done running experiment\n", workerID)
 }
 
@@ -95,6 +86,9 @@ func launch(cmd *exec.Cmd, doneMsg string) (<-chan struct{}, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+
+	// Wait for mallocs and mmaps to complete
+	time.Sleep(time.Millisecond * 500)
 
 	done := make(chan struct{})
 	go func(d chan<- struct{}) {
@@ -107,6 +101,36 @@ func launch(cmd *exec.Cmd, doneMsg string) (<-chan struct{}, error) {
 	return done, nil
 }
 
+func calculcateMemoryForFinalProcess(workerID int, cgroupPath string, memLimB uint64) (uint64, uint64) {
+	actualMemUsageB, actualMemswUsageB := readActualMemoryUsage(cgroupPath)
+	logger.Printf("worker %d %dB mem, %dB memsw remaining\n", workerID, memLimB-actualMemUsageB, memLimB-actualMemswUsageB)
+
+	if workerID%3 == 0 {
+		// huge page
+		return 0, (memLimB / 5) / 1024
+	}
+
+	if workerID%3 == 1 {
+		return (memLimB-actualMemswUsageB)/1024 + 32, 0
+	}
+
+	if workerID%3 == 2 {
+		return ((memLimB - actualMemswUsageB) / 2) / 1024, 0
+	}
+
+	panic("unreachable")
+}
+
+func killAll(cmds ...*exec.Cmd) error {
+	for _, cmd := range cmds {
+		if err := kill(cmd); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func kill(cmd *exec.Cmd) error {
 	if err := cmd.Process.Kill(); err != nil {
 		if err.Error() == "os: process already finished" {
@@ -115,7 +139,6 @@ func kill(cmd *exec.Cmd) error {
 		return err
 	}
 
-	cmd.Process.Wait()
 	return nil
 }
 
@@ -141,23 +164,16 @@ func runInCgroup(cgroupPath string, argv ...string) *exec.Cmd {
 	return cmd
 }
 
-func awaitPaging(cgroupPath string) (uint64, uint64) {
-	for {
-		memUsage, memswUsage := readActualMemoryUsage(cgroupPath)
-
-		if memswUsage != memUsage {
-			return memUsage, memswUsage
-		}
-
-		time.Sleep(time.Second)
-	}
-}
-
 func setupLimits(cgroupPath string, memLimB uint64) {
 	memLimStr := fmt.Sprintf("%d", memLimB)
 	must("writing mem limit", ioutil.WriteFile(cgroupPath+"/memory.limit_in_bytes", []byte(memLimStr), 0))
 	must("writing memsw limit", ioutil.WriteFile(cgroupPath+"/memory.memsw.limit_in_bytes", []byte(memLimStr), 0))
 	must("setting swappiness", ioutil.WriteFile(cgroupPath+"/memory.swappiness", []byte("100"), 0))
+}
+
+func accessProcessMemory(cmd *exec.Cmd) {
+	ioutil.ReadFile(fmt.Sprintf("/proc/%d/environ", cmd.Process.Pid))
+	ioutil.ReadFile(fmt.Sprintf("/proc/%d/cmdline", cmd.Process.Pid))
 }
 
 func must(action string, err error) {
