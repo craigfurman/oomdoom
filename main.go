@@ -33,14 +33,6 @@ func main() {
 	}
 }
 
-func runInCgroup(cgroupPath string, argv ...string) *exec.Cmd {
-	shellCmd := fmt.Sprintf("echo $$ > %s/cgroup.procs && exec %s", cgroupPath, strings.Join(argv, " "))
-	cmd := exec.Command("bash", "-c", shellCmd)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd
-}
-
 func runExperiments(hogProg string, memLimB uint64, workerID int) {
 	for {
 		runExperiment(hogProg, memLimB, workerID)
@@ -53,52 +45,33 @@ func runExperiment(hogProg string, memLimB uint64, workerID int) {
 	id := uuid.New()
 	cgroupPath := "/sys/fs/cgroup/memory/" + id
 	must("creating group path", os.Mkdir(cgroupPath, 0755))
-
-	memLimStr := fmt.Sprintf("%d", memLimB)
-	must("writing mem limit", ioutil.WriteFile(cgroupPath+"/memory.limit_in_bytes", []byte(memLimStr), 0))
-	must("writing memsw limit", ioutil.WriteFile(cgroupPath+"/memory.memsw.limit_in_bytes", []byte(memLimStr), 0))
-	must("setting swappiness", ioutil.WriteFile(cgroupPath+"/memory.swappiness", []byte("100"), 0))
+	setupLimits(cgroupPath, memLimB)
 
 	memLimKB := memLimB / 1024
 	bulkOfMemKB := memLimKB * 19 / 20
 
 	hogMemoryCmd := runInCgroup(cgroupPath, hogProg, fmt.Sprintf("%d", bulkOfMemKB))
-	must("launching hog process", hogMemoryCmd.Start())
+	hogDone, err := launch(hogMemoryCmd, fmt.Sprintf("worker %d hog done", workerID))
+	must("launching hog process", err)
 
-	cgroupProcs := cgroupPath + "/cgroup.procs"
-	must("adding 1st process to cgroup", ioutil.WriteFile(cgroupProcs, []byte(fmt.Sprintf("%d", hogMemoryCmd.Process.Pid)), 0))
 	actualMemUsageB, actualMemswUsageB := awaitPaging(cgroupPath)
 
 	logger.Printf("worker %d (uuid %s) paged\n", workerID, id)
-	logger.Printf("worker %d %dB mem, %dB memsw remaining\n", workerID, memLimB-uint64(actualMemUsageB), memLimB-uint64(actualMemswUsageB))
+	logger.Printf("worker %d %dB mem, %dB memsw remaining\n", workerID, memLimB-actualMemUsageB, memLimB-actualMemswUsageB)
 
-	remainderMemKB := (memLimB - uint64(actualMemswUsageB) + 4096) / 1024
+	remainderMemKB := (memLimB - actualMemswUsageB + 4096) / 1024
 	logger.Printf("worker %d starting remainder with %dKB\n", workerID, remainderMemKB)
 	remainderCmd := runInCgroup(cgroupPath, hogProg, fmt.Sprintf("%d", remainderMemKB))
-	must("launching remainder process", remainderCmd.Start())
-	must("adding 2nd process to cgroup", ioutil.WriteFile(cgroupProcs, []byte(fmt.Sprintf("%d", remainderCmd.Process.Pid)), 0))
-
-	// Ignore errors on purpose, this will always fail with OOM
-	hogDone := make(chan struct{})
-	remainderDone := make(chan struct{})
-	go func() {
-		hogMemoryCmd.Wait()
-		logger.Printf("worker %d hog exited\n", workerID)
-		close(hogDone)
-	}()
-	go func() {
-		remainderCmd.Wait()
-		logger.Printf("worker %d remainder exited\n", workerID)
-		close(remainderDone)
-	}()
+	remainderDone, err := launch(remainderCmd, fmt.Sprintf("worker %d remainder done", workerID))
+	must("launching remainder process", err)
 
 	select {
 	case <-hogDone:
 		logger.Printf("worker %d killing remainder process\n", workerID)
-		must("killing remainder process", killAndWait(remainderCmd))
+		must("killing remainder process", kill(remainderCmd))
 	case <-remainderDone:
 		logger.Printf("worker %d killing hog process\n", workerID)
-		must("killing hog process", killAndWait(hogMemoryCmd))
+		must("killing hog process", kill(hogMemoryCmd))
 	case <-time.After(time.Second * 5):
 		logger.Printf("worker %d (uuid %s) has not been OOM killed\n", workerID, id)
 		actualMemB, actualMemswB := readActualMemoryUsage(cgroupPath)
@@ -109,8 +82,8 @@ func runExperiment(hogProg string, memLimB uint64, workerID int) {
 				time.Sleep(time.Hour)
 			}
 		}
-		must("killing hog process", killAndWait(hogMemoryCmd))
-		must("killing remainder process", killAndWait(remainderCmd))
+		must("killing hog process", kill(hogMemoryCmd))
+		must("killing remainder process", kill(remainderCmd))
 	}
 
 	must("remove cgroup path", os.Remove(cgroupPath))
@@ -118,32 +91,57 @@ func runExperiment(hogProg string, memLimB uint64, workerID int) {
 	logger.Printf("worker %d done running experiment\n", workerID)
 }
 
-func killAndWait(cmd *exec.Cmd) error {
+func launch(cmd *exec.Cmd, doneMsg string) (<-chan struct{}, error) {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	done := make(chan struct{})
+	go func(d chan<- struct{}) {
+		// Ignore errors on purpose, this will always fail with OOM
+		cmd.Wait()
+		logger.Println(doneMsg)
+		close(d)
+	}(done)
+
+	return done, nil
+}
+
+func kill(cmd *exec.Cmd) error {
 	if err := cmd.Process.Kill(); err != nil {
 		if err.Error() == "os: process already finished" {
 			return nil
 		}
 		return err
 	}
+
 	cmd.Process.Wait()
 	return nil
 }
 
-func readActualMemoryUsage(cgroupPath string) (int, int) {
+func readActualMemoryUsage(cgroupPath string) (uint64, uint64) {
 	memUsageStr, err := ioutil.ReadFile(cgroupPath + "/memory.usage_in_bytes")
 	must("reading mem usage", err)
-	memUsage, err := strconv.Atoi(strings.TrimSpace(string(memUsageStr)))
+	memUsage, err := strconv.ParseUint(strings.TrimSpace(string(memUsageStr)), 10, 64)
 	must("converting mem usage", err)
 
 	memswUsageStr, err := ioutil.ReadFile(cgroupPath + "/memory.memsw.usage_in_bytes")
 	must("reading memsw usage", err)
-	memswUsage, err := strconv.Atoi(strings.TrimSpace(string(memswUsageStr)))
+	memswUsage, err := strconv.ParseUint(strings.TrimSpace(string(memswUsageStr)), 10, 64)
 	must("converting memsw usage", err)
 
 	return memUsage, memswUsage
 }
 
-func awaitPaging(cgroupPath string) (int, int) {
+func runInCgroup(cgroupPath string, argv ...string) *exec.Cmd {
+	shellCmd := fmt.Sprintf("echo $$ > %s/cgroup.procs && exec %s", cgroupPath, strings.Join(argv, " "))
+	cmd := exec.Command("bash", "-c", shellCmd)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
+}
+
+func awaitPaging(cgroupPath string) (uint64, uint64) {
 	for {
 		memUsage, memswUsage := readActualMemoryUsage(cgroupPath)
 
@@ -153,6 +151,13 @@ func awaitPaging(cgroupPath string) (int, int) {
 
 		time.Sleep(time.Second)
 	}
+}
+
+func setupLimits(cgroupPath string, memLimB uint64) {
+	memLimStr := fmt.Sprintf("%d", memLimB)
+	must("writing mem limit", ioutil.WriteFile(cgroupPath+"/memory.limit_in_bytes", []byte(memLimStr), 0))
+	must("writing memsw limit", ioutil.WriteFile(cgroupPath+"/memory.memsw.limit_in_bytes", []byte(memLimStr), 0))
+	must("setting swappiness", ioutil.WriteFile(cgroupPath+"/memory.swappiness", []byte("100"), 0))
 }
 
 func must(action string, err error) {
